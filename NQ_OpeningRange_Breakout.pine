@@ -1,0 +1,299 @@
+// ═══════════════════════════════════════════════════════════════
+// NQ Opening Range Breakout Strategie (15 Min nach NY Open)
+// ═══════════════════════════════════════════════════════════════
+//
+// Logik:
+//   1. Erfasse Hoch/Tief der ersten 15 Minuten nach NY Open (09:30-09:45 ET)
+//   2. Long bei Breakout über das Range-Hoch + Puffer
+//   3. Short bei Breakout unter das Range-Tief - Puffer
+//   4. Stop-Loss an der gegenüberliegenden Range-Seite
+//   5. Take-Profit basierend auf Risk-Reward-Verhältnis
+//   6. Maximal ein Trade pro Tag
+//
+// Für 1-Minuten-Chart auf NQ Futures verwenden.
+// Zeitzone des Charts muss auf "US/Eastern" eingestellt sein!
+//
+//@version=5
+strategy("NQ 15-Min Opening Range Breakout",
+     overlay        = true,
+     initial_capital = 50000,
+     default_qty_type = strategy.fixed,
+     default_qty_value = 1,
+     currency       = currency.USD,
+     commission_type = strategy.commission.cash_per_contract,
+     commission_value = 4.50,
+     slippage       = 1,
+     calc_on_every_tick = false)
+
+// ──────────────────────────────────────────────
+// Eingabeparameter
+// ──────────────────────────────────────────────
+
+grp_time = "Zeitfenster"
+i_rangeStartHour   = input.int(9,  "Range Start Stunde (ET)",  minval=0, maxval=23, group=grp_time)
+i_rangeStartMinute  = input.int(30, "Range Start Minute",       minval=0, maxval=59, group=grp_time)
+i_rangeDuration     = input.int(15, "Range Dauer (Minuten)",     minval=5, maxval=60, group=grp_time)
+i_eodCloseHour      = input.int(15, "EOD Close Stunde (ET)",    minval=0, maxval=23, group=grp_time)
+i_eodCloseMinute    = input.int(55, "EOD Close Minute",         minval=0, maxval=59, group=grp_time)
+i_tradeEndHour      = input.int(16, "Handelsende Stunde (ET)",  minval=0, maxval=23, group=grp_time)
+i_tradeEndMinute    = input.int(0,  "Handelsende Minute",       minval=0, maxval=59, group=grp_time)
+
+grp_entry = "Entry-Regeln"
+i_breakoutBufferTicks = input.int(2,    "Breakout Puffer (Ticks)",           minval=0, maxval=20,  group=grp_entry)
+i_tickSize            = input.float(0.25, "Tick-Größe",                      minval=0.01,          group=grp_entry)
+i_onlyFirstBreakout   = input.bool(true, "Nur erster Breakout pro Tag",                            group=grp_entry)
+
+grp_risk = "Risk Management"
+i_stopLossMode    = input.string("Range", "Stop-Loss Modus", options=["Range", "Fixed"], group=grp_risk)
+i_slFixedPoints   = input.float(30,  "SL Feste Punkte (nur bei Fixed)",   minval=1,              group=grp_risk)
+i_slRangeBuffer   = input.int(4,     "SL Range-Puffer (Ticks)",           minval=0, maxval=20,   group=grp_risk)
+i_tpMode          = input.string("RR", "Take-Profit Modus", options=["RR", "Fixed"],              group=grp_risk)
+i_tpRR            = input.float(2.0, "TP Risk-Reward Verhältnis",         minval=0.5, step=0.1,  group=grp_risk)
+i_tpFixedPoints   = input.float(60,  "TP Feste Punkte (nur bei Fixed)",   minval=1,              group=grp_risk)
+
+grp_filter = "Filter"
+i_minRange = input.float(10, "Min Range (Punkte)", minval=0,   group=grp_filter)
+i_maxRange = input.float(80, "Max Range (Punkte)", minval=1,   group=grp_filter)
+
+grp_trail = "Trailing Stop (optional)"
+i_useTrailing       = input.bool(false, "Trailing Stop verwenden",                     group=grp_trail)
+i_trailActivationRR = input.float(1.0,  "Aktivierung ab R-Vielfachem", minval=0.1,    group=grp_trail)
+i_trailDistance     = input.float(15,    "Trailing Abstand (Punkte)",   minval=1,      group=grp_trail)
+
+grp_visual = "Darstellung"
+i_showRange    = input.bool(true,  "Opening Range anzeigen",    group=grp_visual)
+i_showEntries  = input.bool(true,  "Entry-Level anzeigen",      group=grp_visual)
+i_rangeColor   = input.color(color.new(color.blue, 80), "Range Farbe", group=grp_visual)
+i_longColor    = input.color(color.green, "Long Entry Farbe",   group=grp_visual)
+i_shortColor   = input.color(color.red,   "Short Entry Farbe",  group=grp_visual)
+
+// ──────────────────────────────────────────────
+// Zeitberechnung
+// ──────────────────────────────────────────────
+
+rangeEndTotalMin = i_rangeStartHour * 60 + i_rangeStartMinute + i_rangeDuration
+rangeEndHour     = rangeEndTotalMin / 60
+rangeEndMinute   = rangeEndTotalMin % 60
+
+currentTime = hour * 60 + minute
+
+rangeStartTime = i_rangeStartHour * 60 + i_rangeStartMinute
+rangeEndTime   = int(rangeEndHour) * 60 + rangeEndMinute
+eodCloseTime   = i_eodCloseHour   * 60 + i_eodCloseMinute
+tradeEndTime   = i_tradeEndHour   * 60 + i_tradeEndMinute
+
+isInRange     = currentTime >= rangeStartTime and currentTime < rangeEndTime
+isTradeTime   = currentTime >= rangeEndTime   and currentTime < eodCloseTime
+isEOD         = currentTime >= eodCloseTime
+isPastEnd     = currentTime >= tradeEndTime
+
+// Neuer Tag erkennen
+isNewDay = ta.change(time("D")) != 0
+
+// ──────────────────────────────────────────────
+// Opening Range erfassen
+// ──────────────────────────────────────────────
+
+var float rangeHigh     = na
+var float rangeLow      = na
+var bool  rangeComplete = false
+var bool  tradedToday   = false
+
+if isNewDay
+    rangeHigh     := na
+    rangeLow      := na
+    rangeComplete := false
+    tradedToday   := false
+
+if isInRange
+    rangeHigh := na(rangeHigh) ? high : math.max(rangeHigh, high)
+    rangeLow  := na(rangeLow)  ? low  : math.min(rangeLow, low)
+
+if currentTime >= rangeEndTime and not na(rangeHigh) and not na(rangeLow)
+    rangeComplete := true
+
+// Range-Größe und Validierung
+rangeSize  = rangeComplete ? rangeHigh - rangeLow : na
+rangeValid = rangeComplete and not na(rangeSize) and rangeSize >= i_minRange and rangeSize <= i_maxRange
+
+// ──────────────────────────────────────────────
+// Entry-Level berechnen
+// ──────────────────────────────────────────────
+
+bufferPoints = i_breakoutBufferTicks * i_tickSize
+
+longEntry  = rangeValid ? rangeHigh + bufferPoints : na
+shortEntry = rangeValid ? rangeLow  - bufferPoints : na
+
+// ──────────────────────────────────────────────
+// Stop-Loss berechnen
+// ──────────────────────────────────────────────
+
+slBufferPoints = i_slRangeBuffer * i_tickSize
+
+calcLongSL()  =>
+    if i_stopLossMode == "Range"
+        rangeLow - slBufferPoints
+    else
+        longEntry - i_slFixedPoints
+
+calcShortSL() =>
+    if i_stopLossMode == "Range"
+        rangeHigh + slBufferPoints
+    else
+        shortEntry + i_slFixedPoints
+
+// ──────────────────────────────────────────────
+// Take-Profit berechnen
+// ──────────────────────────────────────────────
+
+calcLongTP(entryPrice, stopLoss) =>
+    if i_tpMode == "RR"
+        risk = math.abs(entryPrice - stopLoss)
+        entryPrice + risk * i_tpRR
+    else
+        entryPrice + i_tpFixedPoints
+
+calcShortTP(entryPrice, stopLoss) =>
+    if i_tpMode == "RR"
+        risk = math.abs(entryPrice - stopLoss)
+        entryPrice - risk * i_tpRR
+    else
+        entryPrice - i_tpFixedPoints
+
+// ──────────────────────────────────────────────
+// Trailing Stop Variablen
+// ──────────────────────────────────────────────
+
+var float trailingStop   = na
+var float highestSince   = na
+var float lowestSince    = na
+var float activeEntry    = na
+var float activeRisk     = na
+
+if isNewDay
+    trailingStop := na
+    highestSince := na
+    lowestSince  := na
+    activeEntry  := na
+    activeRisk   := na
+
+// ──────────────────────────────────────────────
+// Entry-Logik
+// ──────────────────────────────────────────────
+
+noPosition = strategy.position_size == 0
+
+if isTradeTime and rangeValid and noPosition and not tradedToday and not isPastEnd
+    // Long Breakout
+    if high >= longEntry
+        sl = calcLongSL()
+        tp = calcLongTP(longEntry, sl)
+        strategy.entry("Long", strategy.long)
+        strategy.exit("Long Exit", "Long", stop=sl, limit=tp)
+        tradedToday  := true
+        activeEntry  := longEntry
+        activeRisk   := math.abs(longEntry - sl)
+        highestSince := high
+        trailingStop := na
+    // Short Breakout (nur wenn kein Long getriggert wurde)
+    else if low <= shortEntry
+        sl = calcShortSL()
+        tp = calcShortTP(shortEntry, sl)
+        strategy.entry("Short", strategy.short)
+        strategy.exit("Short Exit", "Short", stop=sl, limit=tp)
+        tradedToday  := true
+        activeEntry  := shortEntry
+        activeRisk   := math.abs(shortEntry - sl)
+        lowestSince  := low
+        trailingStop := na
+
+    // Nur erster Breakout?
+    if i_onlyFirstBreakout
+        tradedToday := true
+
+// ──────────────────────────────────────────────
+// Trailing Stop Management
+// ──────────────────────────────────────────────
+
+if i_useTrailing and not noPosition and not na(activeEntry) and not na(activeRisk) and activeRisk > 0
+    if strategy.position_size > 0
+        // Long Position
+        highestSince := na(highestSince) ? high : math.max(highestSince, high)
+        currentR = (highestSince - activeEntry) / activeRisk
+        if currentR >= i_trailActivationRR
+            newTrail = highestSince - i_trailDistance
+            if na(trailingStop) or newTrail > trailingStop
+                trailingStop := newTrail
+                strategy.exit("Long Exit", "Long", stop=trailingStop)
+
+    else if strategy.position_size < 0
+        // Short Position
+        lowestSince := na(lowestSince) ? low : math.min(lowestSince, low)
+        currentR = (activeEntry - lowestSince) / activeRisk
+        if currentR >= i_trailActivationRR
+            newTrail = lowestSince + i_trailDistance
+            if na(trailingStop) or newTrail < trailingStop
+                trailingStop := newTrail
+                strategy.exit("Short Exit", "Short", stop=trailingStop)
+
+// ──────────────────────────────────────────────
+// EOD Close
+// ──────────────────────────────────────────────
+
+if isEOD and not noPosition
+    strategy.close_all(comment="EOD Close")
+    trailingStop := na
+
+// ──────────────────────────────────────────────
+// Visualisierung
+// ──────────────────────────────────────────────
+
+// Opening Range Box
+var box rangeBox = na
+if isNewDay and i_showRange
+    rangeBox := na
+
+if i_showRange and rangeComplete and isTradeTime and not isEOD
+    if na(rangeBox) or isNewDay[1]
+        rangeBox := box.new(bar_index - i_rangeDuration, rangeHigh, bar_index, rangeLow,
+             border_color=color.blue, bgcolor=i_rangeColor, border_width=1)
+    else
+        box.set_right(rangeBox, bar_index)
+
+// Entry-Level Linien
+plot(i_showEntries and isTradeTime and rangeValid and not tradedToday ? longEntry  : na,
+     "Long Entry",  color=i_longColor,  style=plot.style_linebr, linewidth=2)
+plot(i_showEntries and isTradeTime and rangeValid and not tradedToday ? shortEntry : na,
+     "Short Entry", color=i_shortColor, style=plot.style_linebr, linewidth=2)
+
+// Range High/Low
+plot(rangeComplete and not isEOD ? rangeHigh : na,
+     "Range High", color=color.new(color.blue, 50), style=plot.style_linebr, linewidth=1)
+plot(rangeComplete and not isEOD ? rangeLow  : na,
+     "Range Low",  color=color.new(color.blue, 50), style=plot.style_linebr, linewidth=1)
+
+// Hintergrund während Range-Erfassung
+bgcolor(isInRange ? color.new(color.orange, 90) : na, title="Range-Erfassung")
+
+// ──────────────────────────────────────────────
+// Info-Tabelle
+// ──────────────────────────────────────────────
+
+var table infoTable = table.new(position.top_right, 2, 6,
+     bgcolor=color.new(color.gray, 85), border_width=1)
+
+if barstate.islast
+    table.cell(infoTable, 0, 0, "Parameter",       text_color=color.white, text_size=size.small)
+    table.cell(infoTable, 1, 0, "Wert",             text_color=color.white, text_size=size.small)
+    table.cell(infoTable, 0, 1, "Range",            text_size=size.small)
+    table.cell(infoTable, 1, 1, rangeComplete ? str.tostring(rangeSize, "#.##") + " Pts" : "---", text_size=size.small)
+    table.cell(infoTable, 0, 2, "Range gültig",     text_size=size.small)
+    table.cell(infoTable, 1, 2, rangeValid ? "Ja" : "Nein",
+         text_color=rangeValid ? color.green : color.red, text_size=size.small)
+    table.cell(infoTable, 0, 3, "Long Entry",       text_size=size.small)
+    table.cell(infoTable, 1, 3, not na(longEntry) ? str.tostring(longEntry, "#.##") : "---", text_size=size.small)
+    table.cell(infoTable, 0, 4, "Short Entry",      text_size=size.small)
+    table.cell(infoTable, 1, 4, not na(shortEntry) ? str.tostring(shortEntry, "#.##") : "---", text_size=size.small)
+    table.cell(infoTable, 0, 5, "Heute gehandelt",  text_size=size.small)
+    table.cell(infoTable, 1, 5, tradedToday ? "Ja" : "Nein", text_size=size.small)
