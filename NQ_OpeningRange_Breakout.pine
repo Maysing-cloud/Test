@@ -170,6 +170,7 @@ var float highestSince   = na
 var float lowestSince    = na
 var float activeEntry    = na
 var float activeRisk     = na
+var float activeTP       = na
 
 if isNewDay
     trailingStop := na
@@ -177,6 +178,7 @@ if isNewDay
     lowestSince  := na
     activeEntry  := na
     activeRisk   := na
+    activeTP     := na
 
 // ──────────────────────────────────────────────
 // Entry-Logik
@@ -191,9 +193,11 @@ if isTradeTime and rangeValid and noPosition and not tradedToday and not isPastE
         tp = calcLongTP(longEntry, sl)
         strategy.entry("Long", strategy.long)
         strategy.exit("Long Exit", "Long", stop=sl, limit=tp)
-        tradedToday  := true
+        if i_onlyFirstBreakout
+            tradedToday := true
         activeEntry  := longEntry
         activeRisk   := math.abs(longEntry - sl)
+        activeTP     := tp
         highestSince := high
         trailingStop := na
     // Short Breakout (nur wenn kein Long getriggert wurde)
@@ -202,15 +206,13 @@ if isTradeTime and rangeValid and noPosition and not tradedToday and not isPastE
         tp = calcShortTP(shortEntry, sl)
         strategy.entry("Short", strategy.short)
         strategy.exit("Short Exit", "Short", stop=sl, limit=tp)
-        tradedToday  := true
+        if i_onlyFirstBreakout
+            tradedToday := true
         activeEntry  := shortEntry
         activeRisk   := math.abs(shortEntry - sl)
+        activeTP     := tp
         lowestSince  := low
         trailingStop := na
-
-    // Nur erster Breakout?
-    if i_onlyFirstBreakout
-        tradedToday := true
 
 // ──────────────────────────────────────────────
 // Trailing Stop Management
@@ -225,7 +227,7 @@ if i_useTrailing and not noPosition and not na(activeEntry) and not na(activeRis
             newTrail = highestSince - i_trailDistance
             if na(trailingStop) or newTrail > trailingStop
                 trailingStop := newTrail
-                strategy.exit("Long Exit", "Long", stop=trailingStop)
+                strategy.exit("Long Exit", "Long", stop=trailingStop, limit=activeTP)
 
     else if strategy.position_size < 0
         // Short Position
@@ -235,7 +237,7 @@ if i_useTrailing and not noPosition and not na(activeEntry) and not na(activeRis
             newTrail = lowestSince + i_trailDistance
             if na(trailingStop) or newTrail < trailingStop
                 trailingStop := newTrail
-                strategy.exit("Short Exit", "Short", stop=trailingStop)
+                strategy.exit("Short Exit", "Short", stop=trailingStop, limit=activeTP)
 
 // ──────────────────────────────────────────────
 // EOD Close
@@ -252,6 +254,8 @@ if isEOD and not noPosition
 // Opening Range Box
 var box rangeBox = na
 if isNewDay and i_showRange
+    if not na(rangeBox)
+        box.delete(rangeBox)
     rangeBox := na
 
 if i_showRange and rangeComplete and isTradeTime and not isEOD
